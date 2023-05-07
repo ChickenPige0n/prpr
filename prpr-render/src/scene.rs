@@ -80,7 +80,8 @@ impl Scene for MainScene {
             let mut r = Rect::new(pad, ui.top * 2. - h + pad, dx - pad * 2., h - pad * 2.);
             if ui.button("preview", r, "预览") {
                 let info = self.edit.info.clone();
-                let config = self.config.clone();
+                let mut config = self.config.clone();
+                config.autoplay = true;
                 let fs = self.fs.clone_box();
                 let edit = self.edit.clone();
                 self.loading_scene_task = Some(Box::pin(async move {
