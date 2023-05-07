@@ -1,5 +1,7 @@
 # prpr - <ins>P</ins>hig<ins>R</ins>os <ins>P</ins>layer, written in <ins>R</ins>ust
 
+#### This respority is modified for my own chart rendering demands.
+
 [中文文档](https://mivik.moe/prpr-docs)
 
 [Resource Pack Collection](https://prprblog.kevin2106.top/)
