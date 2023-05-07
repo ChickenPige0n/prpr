@@ -11,7 +11,7 @@ use super::{
 use crate::{
     bin::{BinaryReader, BinaryWriter},
     config::Config,
-    core::{copy_fbo, BadNote, Chart, ChartExtra, Effect, Point, Resource, UIElement, Vector},
+    core::{copy_fbo, BadNote, Chart, ChartExtra, Effect, Point, Resource, UIElement, Vector, StaticTween, TweenFunction},
     ext::{parse_time, screen_aspect, semi_white, RectExt, SafeTexture},
     fs::FileSystem,
     info::{ChartFormat, ChartInfo},
@@ -335,9 +335,9 @@ impl GameScene {
         let res = &mut self.res;
         let eps = 2e-2 / res.aspect_ratio;
         let top = -1. / res.aspect_ratio;
-        let pause_w = 0.015;
-        let pause_h = pause_w * 3.2;
-        let pause_center = Point::new(pause_w * 4.0 - 1., top + eps * 3.5 - (1. - p) * 0.4 + pause_h / 2.);
+        let pause_w = 0.012;
+        let pause_h = pause_w * 3.375;
+        let pause_center = Point::new(pause_w * 4.4 - 1., top + eps * 3.6454 - (1. - p) * 0.4 + pause_h / 2.);
         if res.config.interactive
             && !tm.paused()
             && self.pause_rewind.is_none()
@@ -361,16 +361,16 @@ impl GameScene {
             }
         }
         if tm.now() as f32 - self.pause_first_time <= PAUSE_CLICK_INTERVAL {
-            ui.fill_circle(pause_center.x, pause_center.y, 0.05, Color::new(1., 1., 1., 0.5));
+            ui.fill_circle(pause_center.x, pause_center.y, 0.05*StaticTween(19).y((tm.now() as f32 - self.pause_first_time)/PAUSE_CLICK_INTERVAL), Color::new(1., 1., 1., 0.5*(1.-StaticTween(18).y((tm.now() as f32 - self.pause_first_time)/PAUSE_CLICK_INTERVAL))));
         }
 
-        let margin = 0.03;
+        let margin = 0.046;
 
         self.chart.with_element(ui, res, UIElement::Score, |ui, color, scale| {
             ui.text(format!("{:07}", self.judge.score()))
-                .pos(1. - margin, top + eps * 2.2 - (1. - p) * 0.4)
+                .pos(1. - margin + 0.001, top + eps * 2.8125 - (1. - p) * 0.4)
                 .anchor(1., 0.)
-                .size(0.8)
+                .size(0.70867) //magic constant(
                 .color(Color { a: color.a * c.a, ..color })
                 .scale(scale)
                 .draw();
@@ -414,7 +414,7 @@ impl GameScene {
             });
         }
         let lf = -1. + margin;
-        let bt = -top - eps * 2.8;
+        let bt = -top - eps * 3.64;
         self.chart.with_element(ui, res, UIElement::Name, |ui, color, scale| {
             ui.text(&res.info.name)
                 .pos(lf, bt + (1. - p) * 0.4)
