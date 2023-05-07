@@ -1,4 +1,4 @@
-use super::{chart::ChartSettings, BpmList, CtrlObject, JudgeLine, Matrix, Object, Point, Resource, JUDGE_LINE_GOOD_COLOR, JUDGE_LINE_PERFECT_COLOR};
+use super::{chart::ChartSettings, BpmList, CtrlObject, JudgeLine, Matrix, Object, Point, Resource};
 use crate::{judge::JudgeStatus, parse::RPE_HEIGHT};
 use macroquad::prelude::*;
 
@@ -133,7 +133,11 @@ impl Note {
         if let Some(color) = if let JudgeStatus::Hold(perfect, at, ..) = &mut self.judge {
             if res.time > *at {
                 *at += HOLD_PARTICLE_INTERVAL / res.config.speed;
-                Some(if *perfect { JUDGE_LINE_PERFECT_COLOR } else { JUDGE_LINE_GOOD_COLOR })
+                Some(if *perfect {
+                    res.res_pack.info.fx_perfect()
+                } else {
+                    res.res_pack.info.fx_good()
+                })
             } else {
                 None
             }
@@ -200,7 +204,7 @@ impl Note {
             return;
         }
         let order = self.kind.order();
-        let style = if res.config.multiple_hint && self.multiple_hint {
+        let style = if res.config.double_hint && self.multiple_hint {
             &res.res_pack.note_style_mh
         } else {
             &res.res_pack.note_style
@@ -220,7 +224,7 @@ impl Note {
             }
             NoteKind::Hold { end_time, end_height } => {
                 res.with_model(self.now_transform(res, ctrl_obj, 0., 0.), |res| {
-                    let style = if res.config.multiple_hint && self.multiple_hint {
+                    let style = if res.config.double_hint && self.multiple_hint {
                         &res.res_pack.note_style_mh
                     } else {
                         &res.res_pack.note_style

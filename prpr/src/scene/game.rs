@@ -2,11 +2,17 @@
 
 crate::tl_file!("game");
 
-use super::{draw_background, ending::RecordUpdateState, request_input, return_input, show_message, take_input, EndingScene, NextScene, Scene};
+use super::{
+    draw_background,
+    ending::RecordUpdateState,
+    loading::{BasicPlayer, UploadFn},
+    request_input, return_input, show_message, take_input, EndingScene, NextScene, Scene,
+};
 use crate::{
+    bin::{BinaryReader, BinaryWriter},
     config::Config,
-    core::{copy_fbo, BadNote, Chart, ChartExtra, Effect, Point, Resource, UIElement, Vector, JUDGE_LINE_GOOD_COLOR, JUDGE_LINE_PERFECT_COLOR},
-    ext::{screen_aspect, RectExt, SafeTexture},
+    core::{copy_fbo, BadNote, Chart, ChartExtra, Effect, Point, Resource, UIElement, Vector},
+    ext::{parse_time, screen_aspect, semi_white, RectExt, SafeTexture},
     fs::FileSystem,
     info::{ChartFormat, ChartInfo},
     judge::Judge,
@@ -20,13 +26,16 @@ use concat_string::concat_string;
 use lyon::path::Path;
 use macroquad::{prelude::*, window::InternalGlContext};
 use sasa::{Music, MusicParams};
+use serde::{Deserialize, Serialize};
 use std::{
-    io::ErrorKind,
+    any::Any,
+    fs::File,
+    io::{Cursor, ErrorKind},
     ops::{DerefMut, Range},
     path::PathBuf,
     process::{Command, Stdio},
     rc::Rc,
-    sync::Mutex,
+    sync::{Arc, Mutex},
 };
 
 const PAUSE_CLICK_INTERVAL: f32 = 0.7;
@@ -40,6 +49,33 @@ pub static FFMPEG_PATH: Mutex<Option<PathBuf>> = Mutex::new(None);
 
 const WAIT_TIME: f32 = 0.5;
 const AFTER_TIME: f32 = 0.7;
+
+#[derive(Clone, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct SimpleRecord {
+    pub score: i32,
+    pub accuracy: f32,
+    pub full_combo: bool,
+}
+
+impl SimpleRecord {
+    pub fn update(&mut self, other: &SimpleRecord) -> bool {
+        let mut changed = false;
+        if other.score > self.score {
+            self.score = other.score;
+            changed = true;
+        }
+        if other.accuracy > self.accuracy {
+            self.accuracy = other.accuracy;
+            changed = true;
+        }
+        if other.full_combo > self.full_combo {
+            self.full_combo = other.full_combo;
+            changed = true;
+        }
+        changed
+    }
+}
 
 fn fmt_time(t: f32) -> String {
     let f = t < 0.;
@@ -82,8 +118,8 @@ pub struct GameScene {
     pub chart: Chart,
     pub judge: Judge,
     pub gl: InternalGlContext<'static>,
-    player: Option<String>,
-    chart_str: String,
+    player: Option<BasicPlayer>,
+    chart_bytes: Vec<u8>,
     chart_format: ChartFormat,
     info_offset: f32,
     compatible_mode: bool,
@@ -105,7 +141,7 @@ pub struct GameScene {
 
     bad_notes: Vec<BadNote>,
 
-    upload_fn: Option<fn(String) -> Task<Result<RecordUpdateState>>>,
+    upload_fn: Option<UploadFn>,
 }
 
 macro_rules! reset {
@@ -113,7 +149,7 @@ macro_rules! reset {
         $self.bad_notes.clear();
         $self.judge.reset();
         $self.chart.reset();
-        $res.judge_line_color = JUDGE_LINE_PERFECT_COLOR;
+        $res.judge_line_color = Color::from_hex($res.res_pack.info.color_perfect);
         $self.music.pause()?;
         $self.music.seek_to(0.)?;
         $tm.reset();
@@ -138,7 +174,7 @@ impl GameScene {
         bail!("Cannot find chart file")
     }
 
-    pub async fn load_chart(fs: &mut dyn FileSystem, info: &ChartInfo) -> Result<(Chart, String, ChartFormat)> {
+    pub async fn load_chart(fs: &mut dyn FileSystem, info: &ChartInfo) -> Result<(Chart, Vec<u8>, ChartFormat)> {
         let extra = fs.load_file("extra.json").await.ok().map(String::from_utf8).transpose()?;
         let extra = if let Some(extra) = extra {
             let ffmpeg: PathBuf = FFMPEG_PATH.lock().unwrap().to_owned().unwrap_or_else(|| "ffmpeg".into());
@@ -155,25 +191,34 @@ impl GameScene {
         } else {
             ChartExtra::default()
         };
-        let text = String::from_utf8(Self::load_chart_bytes(fs, info).await.context("Failed to load chart")?)?;
+        let bytes = Self::load_chart_bytes(fs, info).await.context("Failed to load chart")?;
         let format = info.format.clone().unwrap_or_else(|| {
-            if text.starts_with('{') {
-                if text.contains("\"META\"") {
-                    ChartFormat::Rpe
+            if let Ok(text) = String::from_utf8(bytes.clone()) {
+                if text.starts_with('{') {
+                    if text.contains("\"META\"") {
+                        ChartFormat::Rpe
+                    } else {
+                        ChartFormat::Pgr
+                    }
                 } else {
-                    ChartFormat::Pgr
+                    ChartFormat::Pec
                 }
             } else {
-                ChartFormat::Pec
+                ChartFormat::Pbc
             }
         });
         let mut chart = match format {
-            ChartFormat::Rpe => parse_rpe(&text, fs, extra).await,
-            ChartFormat::Pgr => parse_phigros(&text, extra),
-            ChartFormat::Pec => parse_pec(&text, extra),
+            ChartFormat::Rpe => parse_rpe(&String::from_utf8_lossy(&bytes), fs, extra).await,
+            ChartFormat::Pgr => parse_phigros(&String::from_utf8_lossy(&bytes), extra),
+            ChartFormat::Pec => parse_pec(&String::from_utf8_lossy(&bytes), extra),
+            ChartFormat::Pbc => {
+                let mut r = BinaryReader::new(Cursor::new(&bytes));
+                r.read()
+            }
         }?;
+        chart.load_textures(fs).await?;
         chart.settings.hold_partial_cover = info.hold_partial_cover;
-        Ok((chart, text, format))
+        Ok((chart, bytes, format))
     }
 
     pub async fn new(
@@ -181,11 +226,11 @@ impl GameScene {
         info: ChartInfo,
         mut config: Config,
         mut fs: Box<dyn FileSystem>,
-        player: (Option<SafeTexture>, Option<String>),
+        player: Option<BasicPlayer>,
         background: SafeTexture,
         illustration: SafeTexture,
         get_size_fn: Rc<dyn Fn() -> (u32, u32)>,
-        upload_fn: Option<fn(String) -> Task<Result<RecordUpdateState>>>,
+        upload_fn: Option<UploadFn>,
     ) -> Result<Self> {
         match mode {
             GameMode::TweakOffset => {
@@ -196,7 +241,7 @@ impl GameScene {
             }
             _ => {}
         }
-        let (mut chart, chart_str, chart_format) = Self::load_chart(fs.deref_mut(), &info).await?;
+        let (mut chart, chart_bytes, chart_format) = Self::load_chart(fs.deref_mut(), &info).await?;
         let effects = std::mem::take(&mut chart.extra.global_effects);
         if config.fxaa {
             chart
@@ -206,10 +251,17 @@ impl GameScene {
         }
 
         let info_offset = info.offset;
-        let (avatar, player) = player;
-        let mut res = Resource::new(config, info, fs, avatar, background, illustration, chart.extra.effects.is_empty() && effects.is_empty())
-            .await
-            .context("Failed to load resources")?;
+        let mut res = Resource::new(
+            config,
+            info,
+            fs,
+            player.as_ref().and_then(|it| it.avatar.clone()),
+            background,
+            illustration,
+            chart.extra.effects.is_empty() && effects.is_empty(),
+        )
+        .await
+        .context("Failed to load resources")?;
         let exercise_range = (chart.offset + info_offset + res.config.offset)..res.track_length;
 
         let judge = Judge::new(&chart);
@@ -225,7 +277,7 @@ impl GameScene {
             judge,
             gl: unsafe { get_internal_gl() },
             player,
-            chart_str,
+            chart_bytes,
             chart_format,
             compatible_mode: false,
             effects,
@@ -323,6 +375,14 @@ impl GameScene {
                 .scale(scale)
                 .draw();
         });
+        if res.config.show_acc {
+            ui.text(format!("{:05.2}%", self.judge.real_time_accuracy() * 100.))
+                .pos(1. - margin, top + eps * 2.2 - (1. - p) * 0.4 + 0.07)
+                .anchor(1., 0.)
+                .size(0.4)
+                .color(semi_white(0.7))
+                .draw();
+        }
         self.chart.with_element(ui, res, UIElement::Pause, |ui, color, scale| {
             let mut r = Rect::new(pause_center.x - pause_w * 1.5, pause_center.y - pause_h / 2., pause_w, pause_h);
             let ct = pause_center.coords;
@@ -362,6 +422,7 @@ impl GameScene {
                 .size(0.5)
                 .color(Color { a: color.a * c.a, ..color })
                 .scale(scale)
+                .max_width(0.8)
                 .draw();
         });
         self.chart.with_element(ui, res, UIElement::Level, |ui, color, scale| {
@@ -457,6 +518,17 @@ impl GameScene {
                     }
                     Some(1) => {
                         let mut pos = self.music.position();
+                        if (tm.speed - res.config.speed as f64).abs() > 0.01 {
+                            debug!("recreating music");
+                            self.music = res.audio.create_music(
+                                res.music.clone(),
+                                MusicParams {
+                                    amplifier: res.config.volume_music as _,
+                                    playback_rate: res.config.speed as _,
+                                    ..Default::default()
+                                },
+                            )?;
+                        }
                         if self.mode == GameMode::Exercise && tm.now() > self.exercise_range.end as f64 {
                             tm.seek_to(self.exercise_range.start as f64);
                             self.music.seek_to(self.exercise_range.start)?;
@@ -471,14 +543,21 @@ impl GameScene {
                         } else {
                             self.music.seek_to(dst)?;
                         }
+                        let now = tm.now();
+                        tm.speed = res.config.speed as _;
                         tm.resume();
-                        tm.seek_to(tm.now() - 3.);
+                        tm.seek_to(now - 3.);
                         self.pause_rewind = Some(tm.now() - 0.2);
                     }
                     _ => {}
                 }
             }
             if self.mode == GameMode::Exercise {
+                ui.scope(|ui| {
+                    ui.dx(0.3);
+                    ui.dy(-0.3);
+                    ui.slider(tl!("speed"), 0.5..2.0, 0.05, &mut self.res.config.speed, Some(0.5));
+                });
                 ui.dy(0.06);
                 let hw = 0.7;
                 let h = 0.06;
@@ -588,6 +667,11 @@ impl GameScene {
                 ui.text(t.to_string()).anchor(0.5, 0.5).size(1.).color(c).draw();
             }
         }
+        if self.res.config.touch_debug {
+            for touch in Judge::get_touches() {
+                ui.fill_circle(touch.position.x, touch.position.y, 0.04, Color { a: 0.4, ..RED });
+            }
+        }
         Ok(())
     }
 
@@ -663,6 +747,7 @@ impl Scene for GameScene {
         self.music = Self::new_music(&mut self.res)?;
         self.res.camera.render_target = target;
         tm.speed = self.res.config.speed as _;
+        tm.adjust_time = self.res.config.adjust_time;
         reset!(self, self.res, tm);
         set_camera(&self.res.camera);
         self.first_in = true;
@@ -748,16 +833,25 @@ impl Scene for GameScene {
                     let mut record_data = None;
                     // TODO strengthen the protection
                     #[cfg(feature = "closed")]
-                    if let Some(upload_fn) = self.upload_fn {
-                        if !self.res.config.autoplay && self.res.config.speed >= 1.0 - 1e-3 {
+                    if let Some(upload_fn) = &self.upload_fn {
+                        if !self.res.config.offline_mode && !self.res.config.autoplay && self.res.config.speed >= 1.0 - 1e-3 {
                             if let Some(player) = &self.player {
                                 if let Some(chart) = &self.res.info.id {
-                                    use base64::Engine as _;
-                                    record_data = Some(base64::engine::general_purpose::STANDARD.encode(encode_record(self, player, chart)));
+                                    record_data = Some(encode_record(self, player.id, *chart));
                                 }
                             }
                         }
                     }
+                    let result = self.judge.result();
+                    let record = if self.res.config.autoplay || self.res.config.speed < 1.0 - 1e-3 {
+                        None
+                    } else {
+                        Some(SimpleRecord {
+                            score: result.score as _,
+                            accuracy: result.accuracy as _,
+                            full_combo: result.max_combo == result.num_of_notes,
+                        })
+                    };
                     self.next_scene = match self.mode {
                         GameMode::Normal => Some(NextScene::Overlay(Box::new(EndingScene::new(
                             self.res.background.clone(),
@@ -771,8 +865,10 @@ impl Scene for GameScene {
                             self.res.challenge_icons[self.res.config.challenge_color.clone() as usize].clone(),
                             &self.res.config,
                             self.res.res_pack.ending.clone(),
-                            self.upload_fn,
+                            self.upload_fn.as_ref().map(Arc::clone),
+                            self.player.as_ref().map(|it| it.rks),
                             record_data,
+                            record,
                         )?))),
                         GameMode::TweakOffset => Some(NextScene::PopWithResult(Box::new(None::<f32>))),
                         GameMode::Exercise => None,
@@ -791,11 +887,11 @@ impl Scene for GameScene {
         }
         let counts = self.judge.counts();
         self.res.judge_line_color = if counts[2] + counts[3] == 0 {
-            if counts[1] == 0 {
-                JUDGE_LINE_PERFECT_COLOR
+            Color::from_hex(if counts[1] == 0 {
+                self.res.res_pack.info.color_perfect
             } else {
-                JUDGE_LINE_GOOD_COLOR
-            }
+                self.res.res_pack.info.color_good
+            })
         } else {
             WHITE
         };
@@ -836,27 +932,6 @@ impl Scene for GameScene {
             e.update(&self.res);
         }
         if let Some((id, text)) = take_input() {
-            let parse_time = |s: &str| -> Option<f32> {
-                if s.is_empty() {
-                    return None;
-                }
-                let r = s.split(':').collect::<Vec<_>>();
-                if r.len() > 3 {
-                    return None;
-                }
-                let mut iter = r.into_iter().rev();
-                let mut res = iter.next().unwrap().parse::<f32>().ok()?;
-                if res < 0. {
-                    return None;
-                }
-                if let Some(mins) = iter.next() {
-                    res += mins.parse::<u32>().ok()? as f32 * 60.;
-                }
-                if let Some(hrs) = iter.next() {
-                    res += hrs.parse::<u32>().ok()? as f32 * 3600.;
-                }
-                Some(res)
-            };
             let offset = self.offset().min(0.);
             match id.as_str() {
                 "exercise_start" => {
@@ -1023,12 +1098,14 @@ impl Scene for GameScene {
                 tm.resume();
             }
             tm.speed = 1.0;
+            tm.adjust_time = false;
             match self.mode {
                 GameMode::Normal | GameMode::Exercise => NextScene::Pop,
                 GameMode::TweakOffset => NextScene::PopWithResult(Box::new(None::<f32>)),
             }
         } else if let Some(next_scene) = self.next_scene.take() {
             tm.speed = 1.0;
+            tm.adjust_time = false;
             next_scene
         } else {
             NextScene::None

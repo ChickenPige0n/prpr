@@ -16,8 +16,9 @@ use std::{
 };
 use sys_locale::get_locale;
 
-static LANGS: [&str; 2] = ["zh-CN", "en-US"]; // this should be consistent with the macro below (create_bundles)
-pub static LANG_IDENTS: Lazy<[LanguageIdentifier; 2]> = Lazy::new(|| LANGS.map(|lang| lang.parse().unwrap()));
+static LANGS: [&str; 7] = ["zh-CN", "en-US", "ru-RU", "ja-JP", "id-ID", "pl-PL", "th-TH"]; // this should be consistent with the macro below (create_bundles)
+pub static LANG_NAMES: [&str; 7] = ["简体中文", "English", "Русский", "日本語", "Bahasa Indonesia", "Polski", "แบบไทย"]; // this should be consistent with the macro below (create_bundles)
+pub static LANG_IDENTS: Lazy<[LanguageIdentifier; 7]> = Lazy::new(|| LANGS.map(|lang| lang.parse().unwrap()));
 
 #[macro_export]
 macro_rules! create_bundle {
@@ -42,6 +43,11 @@ macro_rules! create_bundles {
         let mut bundles = Vec::new();
         bundles.push($crate::create_bundle!("zh-CN", $file));
         bundles.push($crate::create_bundle!("en-US", $file));
+        bundles.push($crate::create_bundle!("ru-RU", $file));
+        bundles.push($crate::create_bundle!("ja-JP", $file));
+        bundles.push($crate::create_bundle!("id-ID", $file));
+        bundles.push($crate::create_bundle!("pl-PL", $file));
+        bundles.push($crate::create_bundle!("th-TH", $file));
         bundles
     }};
 }
@@ -69,7 +75,7 @@ impl L10nGlobal {
                 order.push(id);
             }
         }
-        order.push(1); // zh-CN
+        order.push(1); // en-US
         Self {
             lang_map,
             order: order.into(),
@@ -87,6 +93,7 @@ pub fn set_locale_order(locales: &[LanguageIdentifier]) {
             ids.push(*lang);
         }
     }
+    ids.push(1); // en-US
     *GLOBAL.order.lock().unwrap() = ids;
     GENERATION.fetch_add(1, Ordering::Relaxed);
 }
@@ -160,7 +167,7 @@ macro_rules! tl_file {
     ($file:literal) => {
         $crate::tl_file!($file tl);
     };
-    ($file:literal $macro_name:ident) => {
+    ($file:literal $macro_name:ident $($p:tt)*) => {
         static L10N_BUNDLES: $crate::l10n::Lazy<$crate::l10n::L10nBundles> = $crate::l10n::Lazy::new(|| $crate::create_bundles!($file).into());
 
         thread_local! {
@@ -171,13 +178,13 @@ macro_rules! tl_file {
             ($d:tt) => {
                 macro_rules! $macro_name {
                     ($d key:expr) => {
-                        L10N_LOCAL.with(|it| it.borrow_mut().format($key, None))
+                        $($p)* L10N_LOCAL.with(|it| it.borrow_mut().format($key, None))
                     };
                     ($d key:expr, $d args:expr) => {
-                        L10N_LOCAL.with(|it| it.borrow_mut().format($key, Some($args)))
+                        $($p)* L10N_LOCAL.with(|it| it.borrow_mut().format($key, Some($args)))
                     };
                     ($d key:expr, $d ($d name:expr => $d value:expr),+) => {
-                        L10N_LOCAL.with(|it| it.borrow_mut().format($key, Some(&$crate::l10n::fluent_args![$d($d name => $d value), *])).to_string())
+                        $($p)* L10N_LOCAL.with(|it| it.borrow_mut().format($key, Some(&$crate::l10n::fluent_args![$d($d name => $d value), *])).to_string())
                     };
                     (err $d ($d body:tt)*) => {
                         anyhow::Error::msg(tl!($d($d body)*))
@@ -186,6 +193,8 @@ macro_rules! tl_file {
                         anyhow::Result::Err(anyhow::Error::msg(tl!($d($d body)*)))?
                     };
                 }
+
+                pub(crate) use $macro_name;
             }
         }
 

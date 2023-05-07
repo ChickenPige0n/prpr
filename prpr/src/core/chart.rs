@@ -1,5 +1,6 @@
-use super::{BpmList, Effect, JudgeLine, Matrix, Resource, UIElement, Vector, Video};
-use crate::{judge::JudgeStatus, ui::Ui};
+use super::{BpmList, Effect, JudgeLine, JudgeLineKind, Matrix, Resource, UIElement, Vector, Video};
+use crate::{fs::FileSystem, judge::JudgeStatus, ui::Ui};
+use anyhow::{Context, Result};
 use macroquad::prelude::*;
 use std::cell::RefCell;
 
@@ -33,7 +34,7 @@ impl Chart {
         let mut order = (0..lines.len())
             .filter(|it| {
                 if let Some(element) = lines[*it].attach_ui {
-                    attach_ui[element as usize] = Some(*it);
+                    attach_ui[element as usize - 1] = Some(*it);
                     false
                 } else {
                     true
@@ -55,7 +56,7 @@ impl Chart {
 
     #[inline]
     pub fn with_element<R>(&self, ui: &mut Ui, res: &Resource, element: UIElement, f: impl FnOnce(&mut Ui, Color, Matrix) -> R) -> R {
-        if let Some(id) = self.attach_ui[element as usize] {
+        if let Some(id) = self.attach_ui[element as usize - 1] {
             let obj = &self.lines[id].object;
             let mut tr = obj.now_translation(res);
             tr.y = -tr.y;
@@ -65,6 +66,15 @@ impl Chart {
         } else {
             f(ui, WHITE, Matrix::identity())
         }
+    }
+
+    pub async fn load_textures(&mut self, fs: &mut dyn FileSystem) -> Result<()> {
+        for line in &mut self.lines {
+            if let JudgeLineKind::Texture(tex, path) = &mut line.kind {
+                *tex = image::load_from_memory(&fs.load_file(path).await.with_context(|| format!("failed to load illustration {path}"))?)?.into();
+            }
+        }
+        Ok(())
     }
 
     pub fn reset(&mut self) {

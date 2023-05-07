@@ -4,13 +4,13 @@ mod ending;
 pub use ending::{EndingScene, RecordUpdateState};
 
 mod game;
-pub use game::{GameMode, GameScene, FFMPEG_PATH};
+pub use game::{GameMode, GameScene, SimpleRecord, FFMPEG_PATH};
 
 mod loading;
-pub use loading::LoadingScene;
+pub use loading::{BasicPlayer, LoadingScene};
 
 use crate::{
-    ext::{draw_image, screen_aspect, SafeTexture, ScaleType},
+    ext::{draw_image, poll_future, screen_aspect, LocalTask, SafeTexture, ScaleType},
     judge::Judge,
     time::TimeManager,
     ui::{BillBoard, Dialog, Message, MessageHandle, MessageKind, Ui},
@@ -18,7 +18,7 @@ use crate::{
 use anyhow::{Error, Result};
 use cfg_if::cfg_if;
 use macroquad::prelude::*;
-use std::{any::Any, cell::RefCell, sync::Mutex};
+use std::{any::Any, cell::RefCell, future::Future, sync::Mutex};
 
 #[derive(Default)]
 pub enum NextScene {
@@ -27,6 +27,7 @@ pub enum NextScene {
     Pop,
     PopN(usize),
     PopWithResult(Box<dyn Any>),
+    PopNWithResult(usize, Box<dyn Any>),
     Exit,
     Overlay(Box<dyn Scene>),
     Replace(Box<dyn Scene>),
@@ -245,14 +246,14 @@ pub fn request_file(id: impl Into<String>) {
                         let tp: ObjcId = msg_send![tp_cls, typeWithFilenameExtension: str_to_ns(e)];
                         std::mem::transmute::<_, ShareId<NSObject>>(ShareId::from_ptr(tp))
                     };
-                    let types = NSArray::from_slice(&[ext("zip"), ext("pez")]);
+                    let types = NSArray::from_slice(&[ext("zip"), ext("pez"), ext("jpg"), ext("png"), ext("jpeg")]);
                     let types: ObjcId = std::mem::transmute(types);
                     msg_send![picker, initForOpeningContentTypes: types]
                 } else {
                     let ext = |e: &str| str_to_ns(e);
-                    let types = NSArray::from_vec(vec![ext("zip"), ext("pez")]);
+                    let types = NSArray::from_vec(vec![ext("public.image"), ext("public.archive")]);
                     let types: ObjcId = std::mem::transmute(types);
-                    msg_send![picker, documentTypes: types inMode: 0]
+                    msg_send![picker, initWithDocumentTypes: types inMode: 0]
                 };
                 let dlg_obj: ObjcId = msg_send![*PICKER_DELEGATE as ObjcId, alloc];
                 let dlg_obj: ObjcId = msg_send![dlg_obj, init];
@@ -385,6 +386,14 @@ impl Main {
                 self.scenes.last_mut().unwrap().on_result(&mut self.tm, result)?;
                 self.scenes.last_mut().unwrap().enter(&mut self.tm, self.target_chooser.choose())?;
             }
+            NextScene::PopNWithResult(num, result) => {
+                for _ in 0..num {
+                    self.scenes.pop();
+                    self.tm.seek_to(self.times.pop().unwrap());
+                }
+                self.scenes.last_mut().unwrap().on_result(&mut self.tm, result)?;
+                self.scenes.last_mut().unwrap().enter(&mut self.tm, self.target_chooser.choose())?;
+            }
             NextScene::Exit => {
                 self.should_exit = true;
             }
@@ -405,6 +414,7 @@ impl Main {
             let now = self.tm.now();
             let delta = (now - self.last_update_time) / touches.len() as f64;
             let start_time = self.tm.start_time;
+            let mut last_err = None;
             DIALOG.with(|it| -> Result<()> {
                 let mut index = 1;
                 touches.retain_mut(|touch| {
@@ -420,11 +430,21 @@ impl Main {
                     } else {
                         drop(guard);
                         self.tm.seek_to(t);
-                        !self.scenes.last_mut().unwrap().touch(&mut self.tm, touch).unwrap_or(false)
+                        match self.scenes.last_mut().unwrap().touch(&mut self.tm, touch) {
+                            Ok(val) => !val,
+                            Err(err) => {
+                                warn!("failed to handle touch: {:?}", err);
+                                last_err = Some(err);
+                                false
+                            }
+                        }
                     }
                 });
                 Ok(())
             })?;
+            if let Some(err) = last_err {
+                return Err(err);
+            }
             self.tm.start_time = start_time;
         }
         self.touches = Some(touches);
@@ -456,7 +476,7 @@ impl Main {
         }
         DIALOG.with(|it| {
             if let Some(dialog) = it.borrow_mut().as_mut() {
-                dialog.render(ui);
+                dialog.render(ui, self.tm.now() as _);
             }
         });
         Ok(())
@@ -502,4 +522,31 @@ fn draw_illustration(tex: Texture2D, x: f32, y: f32, w: f32, h: f32, color: Colo
     };
     crate::ext::draw_parallelogram(r, Some((tex, tr)), color, true);
     r
+}
+
+thread_local! {
+    static LOAD_SCENE_TASK: RefCell<LocalTask<Result<NextScene>>> = RefCell::new(None);
+}
+
+pub fn load_scene<T: Scene + 'static>(future: impl Future<Output = Result<T>> + 'static) {
+    LOAD_SCENE_TASK.with(|it| *it.borrow_mut() = Some(Box::pin(async move { future.await.map(|scene| NextScene::Overlay(Box::new(scene))) })));
+}
+
+pub fn loading_scene() -> bool {
+    LOAD_SCENE_TASK.with(|it| it.borrow().is_some())
+}
+
+pub fn take_loaded_scene() -> Option<Result<NextScene>> {
+    LOAD_SCENE_TASK.with(|it| {
+        let mut guard = it.borrow_mut();
+        if let Some(task) = guard.as_mut() {
+            let res = poll_future(task.as_mut());
+            if res.is_some() {
+                *guard = None;
+            }
+            res
+        } else {
+            None
+        }
+    })
 }

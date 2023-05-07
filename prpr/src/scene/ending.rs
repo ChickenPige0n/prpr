@@ -1,13 +1,13 @@
 crate::tl_file!("ending");
 
-use super::{draw_background, draw_illustration, NextScene, Scene};
+use super::{draw_background, draw_illustration, game::SimpleRecord, loading::UploadFn, NextScene, Scene};
 use crate::{
     config::Config,
     ext::{
         create_audio_manger, draw_parallelogram, draw_parallelogram_ex, draw_text_aligned, screen_aspect, SafeTexture, ScaleType, PARALLELOGRAM_SLOPE,
     },
     info::ChartInfo,
-    judge::{Judge, PlayResult},
+    judge::{icon_index, Judge, PlayResult},
     scene::show_message,
     task::Task,
     ui::{Dialog, MessageHandle, Ui},
@@ -22,6 +22,8 @@ use std::{cell::RefCell, ops::DerefMut};
 pub struct RecordUpdateState {
     pub best: bool,
     pub improvement: u32,
+    pub gain_exp: f32,
+    pub new_rks: f32,
 }
 
 pub struct EndingScene {
@@ -38,7 +40,7 @@ pub struct EndingScene {
     info: ChartInfo,
     result: PlayResult,
     player_name: String,
-    player_rks: f32,
+    player_rks: Option<f32>,
     challenge_texture: SafeTexture,
     challenge_rank: u32,
     autoplay: bool,
@@ -47,9 +49,10 @@ pub struct EndingScene {
     update_state: Option<RecordUpdateState>,
     rated: bool,
 
-    upload_fn: Option<fn(String) -> Task<Result<RecordUpdateState>>>,
+    upload_fn: Option<UploadFn>,
     upload_task: Option<(Task<Result<RecordUpdateState>>, MessageHandle)>,
-    record_data: Option<String>,
+    record_data: Option<Vec<u8>>,
+    record: Option<SimpleRecord>,
 }
 
 impl EndingScene {
@@ -65,19 +68,23 @@ impl EndingScene {
         challenge_texture: SafeTexture,
         config: &Config,
         bgm: AudioClip,
-        upload_fn: Option<fn(String) -> Task<Result<RecordUpdateState>>>,
-        record_data: Option<String>,
+        upload_fn: Option<UploadFn>,
+        player_rks: Option<f32>,
+        record_data: Option<Vec<u8>>,
+        record: Option<SimpleRecord>,
     ) -> Result<Self> {
         let mut audio = create_audio_manger(config)?;
         let bgm = audio.create_music(
             bgm,
             MusicParams {
                 amplifier: config.volume_music,
-                loop_: true,
+                loop_mix_time: 0.,
                 ..Default::default()
             },
         )?;
-        let upload_task = upload_fn.and_then(|f| record_data.clone().map(|data| (f(data), show_message(tl!("uploading")).handle())));
+        let upload_task = upload_fn
+            .as_ref()
+            .and_then(|f| record_data.clone().map(|data| (f(data), show_message(tl!("uploading")).handle())));
         Ok(Self {
             background,
             illustration,
@@ -94,6 +101,8 @@ impl EndingScene {
                 Some(RecordUpdateState {
                     best: true,
                     improvement: result.score,
+                    gain_exp: 0.,
+                    new_rks: 0.,
                 })
             },
             rated: upload_task.is_some(),
@@ -101,7 +110,7 @@ impl EndingScene {
             info,
             result,
             player_name: config.player_name.clone(),
-            player_rks: config.player_rks,
+            player_rks,
             challenge_texture,
             challenge_rank: config.challenge_rank,
             autoplay: config.autoplay,
@@ -111,6 +120,7 @@ impl EndingScene {
             upload_fn,
             upload_task,
             record_data,
+            record,
         })
     }
 }
@@ -148,7 +158,7 @@ impl Scene for EndingScene {
             self.upload_task = self
                 .record_data
                 .clone()
-                .map(|data| ((self.upload_fn.unwrap())(data), show_message(tl!("uploading")).handle()));
+                .map(|data| ((self.upload_fn.as_ref().unwrap())(data), show_message(tl!("uploading")).handle()));
         }
         if let Some((task, handle)) = &mut self.upload_task {
             if let Some(result) = task.take() {
@@ -210,15 +220,12 @@ impl Scene for EndingScene {
         let rr = draw_text_aligned(ui, &self.info.level, r.right() - r.h / 7. * 13. * 0.13 - 0.01, r.bottom() - top / 20., (1., 1.), 0.46, WHITE);
         let p = (r.x + 0.04, r.bottom() - top / 20.);
         let mw = rr.x - 0.02 - p.0;
-        let mut size = 0.7;
-        loop {
-            let mut text = ui.text(&self.info.name).pos(p.0, p.1).anchor(0., 1.).size(size);
-            if text.measure().w > mw {
-                size *= 0.93;
-            } else {
-                text.draw();
-                break;
-            }
+        let mut text = ui.text(&self.info.name).pos(p.0, p.1).anchor(0., 1.).size(0.7);
+        if text.measure().w <= mw {
+            text.draw();
+        } else {
+            drop(text);
+            ui.text(&self.info.name).pos(p.0, p.1).anchor(0., 1.).size(0.5).max_width(mw).draw();
         }
         gl.pop_model_matrix();
 
@@ -235,12 +242,12 @@ impl Scene for EndingScene {
                 format!(" {:.2}x", self.speed)
             };
             let text = if self.autoplay {
-                format!("PRPR[AUTOPLAY] {spd}")
+                format!("PHIRA[AUTOPLAY] {spd}")
             } else if !self.rated {
-                format!("PRPR[UNRATED] {spd}")
+                format!("PHIRA[UNRATED] {spd}")
             } else if let Some(state) = &self.update_state {
                 format!(
-                    "PRPR {spd}  {}",
+                    "PHIRA {spd}  {}",
                     if state.best {
                         format!("NEW BEST +{:07}", state.improvement)
                     } else {
@@ -252,16 +259,7 @@ impl Scene for EndingScene {
             };
             let r = draw_text_aligned(ui, &text, main.x + dx, main.bottom() - 0.035, (0., 1.), 0.34, WHITE);
             let r = draw_text_aligned(ui, &format!("{:07}", res.score), r.x, r.y - 0.023, (0., 1.), 1., WHITE);
-            let icon = match (res.score, res.num_of_notes == res.max_combo) {
-                (x, _) if x < 700000 => 0,
-                (x, _) if x < 820000 => 1,
-                (x, _) if x < 880000 => 2,
-                (x, _) if x < 920000 => 3,
-                (x, _) if x < 960000 => 4,
-                (1000000, _) => 7,
-                (_, false) => 5,
-                (_, true) => 6,
-            };
+            let icon = icon_index(res.score, res.num_of_notes == res.max_combo);
             let p = ran(now, 1.4, 1.9).powi(2);
             let s = main.h * 0.67;
             let ct = (main.right() - main.h * slope - s / 2., r.bottom() + 0.02 - s / 2.);
@@ -370,7 +368,21 @@ impl Scene for EndingScene {
         let sub = Rect::new(1. - 0.13, main.center().y + 0.01, 0.12, 0.03);
         let color = Color::new(1., 1., 1., alpha);
         draw_parallelogram(sub, None, color, false);
-        draw_text_aligned(ui, &format!("{:.2}", self.player_rks), sub.center().x, sub.center().y, (0.5, 0.5), 0.37, Color::new(0., 0., 0., alpha));
+        draw_text_aligned(
+            ui,
+            &if let Some(state) = &self.update_state {
+                format!("{:.2}", state.new_rks)
+            } else if let Some(rks) = &self.player_rks {
+                format!("{rks:.2}")
+            } else {
+                "".to_owned()
+            },
+            sub.center().x,
+            sub.center().y,
+            (0.5, 0.5),
+            0.37,
+            Color::new(0., 0., 0., alpha),
+        );
         let r = draw_illustration(*self.player, 1. - 0.21, main.center().y, 0.12 / (0.076 * 7.), 0.12 / (0.076 * 7.), color);
         let text = draw_text_aligned(ui, &self.player_name, r.x - 0.01, r.center().y, (1., 0.5), 0.54, color);
         draw_parallelogram(
@@ -403,7 +415,13 @@ impl Scene for EndingScene {
         match self.next {
             0 => NextScene::None,
             1 => NextScene::Pop,
-            2 => NextScene::PopN(2),
+            2 => {
+                if let Some(rec) = &self.record {
+                    NextScene::PopNWithResult(2, Box::new(rec.clone()))
+                } else {
+                    NextScene::PopN(2)
+                }
+            }
             _ => unreachable!(),
         }
     }

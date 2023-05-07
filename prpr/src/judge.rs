@@ -1,6 +1,6 @@
 use crate::{
     config::Config,
-    core::{BadNote, Chart, NoteKind, Point, Resource, Vector, JUDGE_LINE_GOOD_COLOR, JUDGE_LINE_PERFECT_COLOR},
+    core::{BadNote, Chart, NoteKind, Point, Resource, Vector, NOTE_WIDTH_RATIO_BASE},
     ext::{get_viewport, NotNanExt},
 };
 use macroquad::prelude::{
@@ -10,18 +10,17 @@ use macroquad::prelude::{
 use miniquad::{EventHandler, MouseButton};
 use once_cell::sync::Lazy;
 use sasa::{PlaySfxParams, Sfx};
-use std::{
-    cell::RefCell,
-    collections::{HashMap, VecDeque},
-    num::FpCategory,
-};
+use serde::Serialize;
+use std::{cell::RefCell, collections::HashMap, num::FpCategory};
 
-pub const FLICK_SPEED_THRESHOLD: f32 = 1.8;
+pub const FLICK_SPEED_THRESHOLD: f32 = 0.8;
 pub const LIMIT_PERFECT: f32 = 0.08;
 pub const LIMIT_GOOD: f32 = 0.16;
 pub const LIMIT_BAD: f32 = 0.22;
-pub const UP_TOLERANCE: f32 = 0.01;
+pub const UP_TOLERANCE: f32 = 0.05;
 pub const DIST_FACTOR: f32 = 0.2;
+
+const EARLY_OFFSET: f32 = 0.07;
 
 pub fn play_sfx(sfx: &mut Sfx, config: &Config) {
     if config.volume_sfx <= 1e-2 {
@@ -32,99 +31,65 @@ pub fn play_sfx(sfx: &mut Sfx, config: &Config) {
     });
 }
 
-pub struct VelocityTracker {
-    movements: VecDeque<(f32, Point)>,
-    last_dir: Vector,
-    wait: bool,
+#[cfg(all(not(target_os = "windows"), not(target_os = "ios")))]
+fn get_uptime() -> f64 {
+    let mut time = libc::timespec { tv_sec: 0, tv_nsec: 0 };
+    let ret = unsafe { libc::clock_gettime(libc::CLOCK_MONOTONIC, &mut time) };
+    assert!(ret == 0);
+    time.tv_sec as f64 + time.tv_nsec as f64 * 1e-9
 }
 
-impl VelocityTracker {
-    pub const RECORD_MAX: usize = 10;
+#[cfg(target_os = "ios")]
+fn get_uptime() -> f64 {
+    use crate::objc::*;
+    msg_send![msg_send![class(ProcessInfo), proecssInfo], systemUptime]
+}
 
-    pub fn empty() -> Self {
+pub struct FlickTracker {
+    threshold: f32,
+    last_point: Point,
+    last_delta: Option<Vector>,
+    last_time: f32,
+    flicked: bool,
+    stopped: bool,
+}
+
+impl FlickTracker {
+    pub fn new(_dpi: u32, time: f32, point: Point) -> Self {
+        // TODO maybe a better approach?
+        let dpi = 275;
         Self {
-            movements: VecDeque::with_capacity(Self::RECORD_MAX),
-            last_dir: Vector::default(),
-            wait: false,
+            threshold: FLICK_SPEED_THRESHOLD * dpi as f32 / 386.,
+            last_point: point,
+            last_delta: None,
+            last_time: time,
+            flicked: false,
+            stopped: true,
         }
-    }
-
-    pub fn new(time: f32, point: Point) -> Self {
-        let mut res = Self::empty();
-        res.push(time, point);
-        res
-    }
-
-    pub fn reset(&mut self) {
-        self.movements.clear();
-        self.last_dir = Vector::default();
-        self.wait = false;
     }
 
     pub fn push(&mut self, time: f32, position: Point) {
-        if self.movements.len() == Self::RECORD_MAX {
-            // TODO optimize
-            self.movements.pop_front();
+        let delta = position - self.last_point;
+        self.last_point = position;
+        if let Some(last_delta) = &self.last_delta {
+            let dt = time - self.last_time;
+            let speed = delta.dot(last_delta) / dt;
+            if speed < self.threshold {
+                self.stopped = true;
+            }
+            if self.stopped && !self.flicked {
+                self.flicked = delta.magnitude() / dt >= self.threshold * 2.;
+            }
+            // if speed < self.threshold || self.stopped {
+            // self.stopped = delta.magnitude() / dt < self.threshold * 5.;
+            // self.flicked = self.threshold <= speed;
+            // if self.flicked {
+            // warn!("new flick!");
+            // }
+            // }
         }
-        self.movements.push_back((time, position));
-    }
-
-    pub fn speed(&self) -> Vector {
-        if self.movements.is_empty() {
-            return Vector::default();
-        }
-        let n = self.movements.len() as f32;
-        let lst = self.movements.back().unwrap().0;
-        let mut sum_x = 0.;
-        let mut sum_x2 = 0.;
-        let mut sum_x3 = 0.;
-        let mut sum_x4 = 0.;
-        let mut sum_y = Point::new(0., 0.);
-        let mut sum_x_y = Point::new(0., 0.);
-        let mut sum_x2_y = Point::new(0., 0.);
-        for (t, pt) in &self.movements {
-            let t = t - lst;
-            let v = pt.coords;
-            let mut w = t;
-            sum_y += v;
-            sum_x += w;
-            sum_x_y += w * v;
-            w *= t;
-            sum_x2 += w;
-            sum_x2_y += w * v;
-            w *= t;
-            sum_x3 += w;
-            sum_x4 += w * t;
-        }
-        let s_xx = sum_x2 - sum_x * sum_x / n;
-        let s_xy = sum_x_y - sum_y * (sum_x / n);
-        let s_xx2 = sum_x3 - sum_x * sum_x2 / n;
-        let s_x2y = sum_x2_y - sum_y * (sum_x2 / n);
-        let s_x2x2 = sum_x4 - sum_x2 * sum_x2 / n;
-        let denom = s_xx * s_x2x2 - s_xx2 * s_xx2;
-        if denom == 0.0 {
-            return Vector::default();
-        }
-        // let a = (s_x2y * s_xx - s_xy * s_xx2) / denom;
-        let b = (s_xy * s_x2x2 - s_x2y * s_xx2) / denom;
-        // let c = (sum_y - b * sum_x - a * sum_x2) / n;
-        #[allow(clippy::let_and_return)]
-        b
-    }
-
-    pub fn has_flick(&mut self, res: &Resource) -> bool {
-        let spd = self.speed();
-        let norm = spd.norm();
-        let threshold = FLICK_SPEED_THRESHOLD * (res.dpi as f32 / 275.);
-        if self.wait && (norm <= threshold * (1.2 / 1.8) || (self.last_dir.dot(&spd.unscale(norm)) - 1.).abs() > 0.4) {
-            self.wait = false;
-        }
-        !self.wait && norm >= threshold
-    }
-
-    pub fn consume_flick(&mut self) {
-        self.last_dir = self.speed().normalize();
-        self.wait = true;
+        self.last_delta = Some(delta.normalize());
+        self.last_time = time;
     }
 }
 
@@ -137,7 +102,7 @@ pub enum JudgeStatus {
 }
 
 #[repr(u8)]
-#[derive(Debug, Copy, Clone)]
+#[derive(Debug, Copy, Clone, Serialize)]
 pub enum Judgement {
     Perfect,
     Good,
@@ -169,9 +134,9 @@ impl JudgeInner {
         }
     }
 
-    pub fn commit(&mut self, what: Judgement, diff: Option<f32>) {
+    pub fn commit(&mut self, what: Judgement, diff: f32) {
         use Judgement::*;
-        if let Some(diff) = diff {
+        if matches!(what, Judgement::Good) {
             self.diffs.push(diff);
         }
         self.counts[what as usize] += 1;
@@ -197,6 +162,14 @@ impl JudgeInner {
 
     pub fn accuracy(&self) -> f64 {
         (self.counts[0] as f64 + self.counts[1] as f64 * 0.65) / self.num_of_notes as f64
+    }
+
+    pub fn real_time_accuracy(&self) -> f64 {
+        let cnt = self.counts.iter().sum::<u32>();
+        if cnt == 0 {
+            return 1.;
+        }
+        (self.counts[0] as f64 + self.counts[1] as f64 * 0.65) / cnt as f64
     }
 
     pub fn score(&self) -> u32 {
@@ -241,7 +214,7 @@ pub struct Judge {
     // notes of each line in order
     // LinkedList::drain_filter is unstable...
     pub notes: Vec<(Vec<u32>, usize)>,
-    pub trackers: HashMap<u64, VelocityTracker>,
+    pub trackers: HashMap<u64, FlickTracker>,
     pub last_time: f32,
 
     key_down_count: u32,
@@ -282,13 +255,18 @@ impl Judge {
         self.inner.reset();
     }
 
-    pub fn commit(&mut self, what: Judgement, diff: Option<f32>) {
+    pub fn commit(&mut self, what: Judgement, diff: f32) {
         self.inner.commit(what, diff);
     }
 
     #[inline]
     pub fn accuracy(&self) -> f64 {
         self.inner.accuracy()
+    }
+
+    #[inline]
+    pub fn real_time_accuracy(&self) -> f64 {
+        self.inner.real_time_accuracy()
     }
 
     #[inline]
@@ -337,6 +315,9 @@ impl Judge {
         const X_DIFF_MAX: f32 = 0.21 / (16. / 9.) * 2.;
         let spd = res.config.speed;
 
+        #[cfg(not(target_os = "windows"))]
+        let uptime = get_uptime();
+
         let t = res.time;
         // TODO optimize
         let mut touches: HashMap<u64, Touch> = {
@@ -349,6 +330,7 @@ impl Judge {
                     id,
                     phase: TouchPhase::Started,
                     position: vec2(p.0, p.1),
+                    time: f64::NEG_INFINITY,
                 });
             } else if is_mouse_button_down(btn) {
                 let p = mouse_position();
@@ -356,6 +338,7 @@ impl Judge {
                     id,
                     phase: TouchPhase::Moved,
                     position: vec2(p.0, p.1),
+                    time: f64::NEG_INFINITY,
                 });
             } else if is_mouse_button_released(btn) {
                 let p = mouse_position();
@@ -363,6 +346,7 @@ impl Judge {
                     id,
                     phase: TouchPhase::Ended,
                     position: vec2(p.0, p.1),
+                    time: f64::NEG_INFINITY,
                 });
             }
             let tr = Self::touch_transform();
@@ -385,19 +369,26 @@ impl Judge {
             }
             let delta = (t / spd - self.last_time) as f64 / (events.len() + 1) as f64;
             let mut t = self.last_time as f64;
-            for Touch { id, phase, position: p } in events.into_iter() {
+            for Touch {
+                id,
+                phase,
+                position: p,
+                time,
+            } in events.into_iter()
+            {
                 t += delta;
                 let t = t as f32;
                 let p = to_local(p);
                 match phase {
                     TouchPhase::Started => {
-                        self.trackers.insert(id, VelocityTracker::new(t, p));
+                        self.trackers.insert(id, FlickTracker::new(res.dpi, t, p));
                         touches
                             .entry(id)
                             .or_insert_with(|| Touch {
                                 id,
                                 phase: TouchPhase::Started,
                                 position: vec2(p.x, p.y),
+                                time,
                             })
                             .phase = TouchPhase::Started;
                     }
@@ -412,7 +403,24 @@ impl Judge {
                 }
             }
         }
-        let touches: Vec<Touch> = touches.into_values().collect();
+        let touches: Vec<Touch> = touches
+            .into_values()
+            .map(|mut it| {
+                it.time = if it.time.is_infinite() {
+                    f64::NEG_INFINITY
+                } else {
+                    #[cfg(target_os = "windows")]
+                    {
+                        it.time
+                    }
+                    #[cfg(not(target_os = "windows"))]
+                    {
+                        t as f64 - (uptime - it.time) * spd as f64
+                    }
+                };
+                it
+            })
+            .collect();
         // pos[line][touch]
         let mut pos = Vec::<Vec<Option<Point>>>::with_capacity(chart.lines.len());
         for id in 0..pos.capacity() {
@@ -436,16 +444,24 @@ impl Judge {
                     .collect(),
             );
         }
+        let time_of = |touch: &Touch| {
+            if touch.time.is_infinite() {
+                t
+            } else {
+                touch.time as f32
+            }
+        };
         let mut judgements = Vec::new();
         // clicks & flicks
         for (id, touch) in touches.iter().enumerate() {
             let click = touch.phase == TouchPhase::Started;
-            let flick = matches!(touch.phase, TouchPhase::Moved | TouchPhase::Stationary)
-                && self.trackers.get_mut(&touch.id).map_or(false, |it| it.has_flick(res));
+            let flick =
+                matches!(touch.phase, TouchPhase::Moved | TouchPhase::Stationary) && self.trackers.get_mut(&touch.id).map_or(false, |it| it.flicked);
             if !(click || flick) {
                 continue;
             }
-            let mut closest = (None, X_DIFF_MAX, LIMIT_BAD);
+            let t = time_of(touch);
+            let mut closest = (None, X_DIFF_MAX, LIMIT_BAD, LIMIT_BAD + (X_DIFF_MAX / NOTE_WIDTH_RATIO_BASE - 1.).max(0.) * DIST_FACTOR);
             for (line_id, ((line, pos), (idx, st))) in chart.lines.iter_mut().zip(pos.iter()).zip(self.notes.iter_mut()).enumerate() {
                 let Some(pos) = pos[id] else { continue; };
                 for id in &idx[*st..] {
@@ -457,16 +473,17 @@ impl Judge {
                         continue;
                     }
                     let dt = (note.time - t) / spd;
-                    if dt >= closest.2 {
+                    if dt >= closest.3 {
                         break;
                     }
+                    let dt = if dt < 0. { (dt + EARLY_OFFSET).min(0.).abs() } else { dt };
                     let x = &mut note.object.translation.0;
                     x.set_time(t);
                     let dist = (x.now() - pos.x).abs();
                     if dist > X_DIFF_MAX {
                         continue;
                     }
-                    if dt.abs()
+                    if dt
                         > if matches!(note.kind, NoteKind::Click) {
                             LIMIT_BAD - LIMIT_PERFECT * (dist - 0.9).max(0.)
                         } else {
@@ -476,20 +493,20 @@ impl Judge {
                         continue;
                     }
                     let dt = if matches!(note.kind, NoteKind::Flick | NoteKind::Drag) {
-                        dt + 0.05
+                        dt + LIMIT_GOOD
                     } else {
                         dt
                     };
-                    if dt + (dist / res.note_width - 1.).max(0.) * DIST_FACTOR
-                        < closest.2 - 0.01 + (closest.1 / res.note_width - 1.).max(0.) * DIST_FACTOR
-                    {
-                        closest = (Some((line_id, *id)), dist, dt + 0.01);
+                    let key = dt + (dist / NOTE_WIDTH_RATIO_BASE - 1.).max(0.) * DIST_FACTOR;
+                    if key < closest.3 {
+                        closest = (Some((line_id, *id)), dist, dt, key);
                     }
                 }
             }
-            if let (Some((line_id, id)), _, dt) = closest {
+            if let (Some((line_id, id)), _, dt, _) = closest {
                 let line = &mut chart.lines[line_id];
                 if matches!(line.notes[id as usize].kind, NoteKind::Drag) {
+                    info!("reject by drag");
                     continue;
                 }
                 if click {
@@ -498,28 +515,31 @@ impl Judge {
                     if matches!(note.kind, NoteKind::Flick) {
                         continue; // to next loop
                     }
-                    let dt = (dt - 0.01).abs();
                     if dt <= LIMIT_GOOD || matches!(note.kind, NoteKind::Hold { .. }) {
                         match note.kind {
                             NoteKind::Click => {
                                 note.judge = JudgeStatus::Judged;
-                                judgements.push((if dt <= LIMIT_PERFECT { Judgement::Perfect } else { Judgement::Good }, line_id, id, None));
+                                judgements.push((if dt <= LIMIT_PERFECT { Judgement::Perfect } else { Judgement::Good }, line_id, id, Some(t)));
                             }
                             NoteKind::Hold { .. } => {
                                 play_sfx(&mut res.sfx_click, &res.config);
-                                note.judge = JudgeStatus::Hold(dt <= LIMIT_PERFECT, t, (t - note.time) / spd, false, f32::INFINITY);
+                                note.judge = JudgeStatus::Hold(dt <= LIMIT_PERFECT, t, t, false, f32::INFINITY);
                             }
                             _ => unreachable!(),
                         };
                     } else {
-                        line.notes[id as usize].judge = JudgeStatus::Judged;
-                        judgements.push((Judgement::Bad, line_id, id, None));
+                        // prevent extra judgements
+                        if matches!(note.judge, JudgeStatus::NotJudged) {
+                            // keep the note after bad judgement
+                            line.notes[id as usize].judge = JudgeStatus::PreJudge;
+                            judgements.push((Judgement::Bad, line_id, id, None));
+                        }
                     }
                 } else {
                     // flick
                     line.notes[id as usize].judge = JudgeStatus::PreJudge;
                     if let Some(tracker) = self.trackers.get_mut(&touch.id) {
-                        tracker.consume_flick();
+                        tracker.flicked = false;
                     }
                 }
             }
@@ -645,8 +665,14 @@ impl Judge {
                         }
                     }
                 }
-                if t < note.time {
-                    break;
+                // TODO adjust
+                let ghost_t = t + LIMIT_GOOD;
+                if matches!(note.kind, NoteKind::Click) {
+                    if ghost_t < note.time {
+                        break;
+                    }
+                } else if t < note.time {
+                    continue;
                 }
                 if matches!(note.judge, JudgeStatus::PreJudge) {
                     let diff = if let JudgeStatus::Hold(.., diff, _, _) = note.judge {
@@ -655,11 +681,13 @@ impl Judge {
                         None
                     };
                     note.judge = JudgeStatus::Judged;
-                    judgements.push((Judgement::Perfect, line_id, *id, diff));
+                    if !matches!(note.kind, NoteKind::Click) {
+                        judgements.push((Judgement::Perfect, line_id, *id, diff));
+                    }
                 }
             }
         }
-        for (judgement, line_id, id, diff) in judgements.into_iter() {
+        for (judgement, line_id, id, diff) in judgements {
             let line = &mut chart.lines[line_id];
             let note = &mut line.notes[id as usize];
             line.object.set_time(t);
@@ -669,10 +697,12 @@ impl Judge {
             let line_tr = line.now_transform(res, &chart.lines);
             self.commit(
                 judgement,
-                if matches!(judgement, Judgement::Good | Judgement::Bad) {
-                    Some(diff.unwrap_or((t - note.time) / spd))
+                if matches!(judgement, Judgement::Miss) {
+                    0.25
+                } else if matches!(note.kind, NoteKind::Drag | NoteKind::Flick) {
+                    0.
                 } else {
-                    None
+                    (diff.unwrap_or(t) - note.time) / spd
                 },
             );
             if matches!(note.kind, NoteKind::Hold { .. }) {
@@ -680,11 +710,11 @@ impl Judge {
             }
             if match judgement {
                 Judgement::Perfect => {
-                    res.with_model(line_tr * note.object.now(res), |res| res.emit_at_origin(note.rotation(line), JUDGE_LINE_PERFECT_COLOR));
+                    res.with_model(line_tr * note.object.now(res), |res| res.emit_at_origin(note.rotation(line), res.res_pack.info.fx_perfect()));
                     true
                 }
                 Judgement::Good => {
-                    res.with_model(line_tr * note.object.now(res), |res| res.emit_at_origin(note.rotation(line), JUDGE_LINE_GOOD_COLOR));
+                    res.with_model(line_tr * note.object.now(res), |res| res.emit_at_origin(note.rotation(line), res.res_pack.info.fx_good()));
                     true
                 }
                 Judgement::Bad => {
@@ -771,7 +801,7 @@ impl Judge {
             }
         }
         for (line_id, id) in judgements.into_iter() {
-            self.commit(Judgement::Perfect, None);
+            self.commit(Judgement::Perfect, 0.);
             let (note_transform, note_kind) = {
                 let line = &mut chart.lines[line_id];
                 let note = &mut line.notes[id as usize];
@@ -782,7 +812,7 @@ impl Judge {
             };
             let line = &chart.lines[line_id];
             res.with_model(line.now_transform(res, &chart.lines) * note_transform, |res| {
-                res.emit_at_origin(line.notes[id as usize].rotation(line), JUDGE_LINE_PERFECT_COLOR)
+                res.emit_at_origin(line.notes[id as usize].rotation(line), res.res_pack.info.fx_perfect())
             });
             if let Some(sfx) = match note_kind {
                 NoteKind::Click => Some(&mut res.sfx_click),
@@ -819,6 +849,7 @@ impl Handler {
                 id: button_to_id(MouseButton::Left),
                 phase: TouchPhase::Moved,
                 position: mouse_position().into(),
+                time: f64::NEG_INFINITY,
             });
         }
     }
@@ -837,11 +868,12 @@ fn button_to_id(button: MouseButton) -> u64 {
 impl EventHandler for Handler {
     fn update(&mut self, _: &mut miniquad::Context) {}
     fn draw(&mut self, _: &mut miniquad::Context) {}
-    fn touch_event(&mut self, _: &mut miniquad::Context, phase: miniquad::TouchPhase, id: u64, x: f32, y: f32) {
+    fn touch_event(&mut self, _: &mut miniquad::Context, phase: miniquad::TouchPhase, id: u64, x: f32, y: f32, time: f64) {
         self.0.push(Touch {
             id,
             phase: phase.into(),
             position: vec2(x, y),
+            time,
         });
     }
 
@@ -850,6 +882,7 @@ impl EventHandler for Handler {
             id: button_to_id(button),
             phase: TouchPhase::Started,
             position: vec2(x, y),
+            time: f64::NEG_INFINITY,
         });
     }
 
@@ -858,6 +891,7 @@ impl EventHandler for Handler {
             id: button_to_id(button),
             phase: TouchPhase::Ended,
             position: vec2(x, y),
+            time: f64::NEG_INFINITY,
         });
     }
 
@@ -882,4 +916,17 @@ pub struct PlayResult {
     pub counts: [u32; 4],
     pub early: u32,
     pub late: u32,
+}
+
+pub fn icon_index(score: u32, full_combo: bool) -> usize {
+    match (score, full_combo) {
+        (x, _) if x < 700000 => 0,
+        (x, _) if x < 820000 => 1,
+        (x, _) if x < 880000 => 2,
+        (x, _) if x < 920000 => 3,
+        (x, _) if x < 960000 => 4,
+        (1000000, _) => 7,
+        (_, false) => 5,
+        (_, true) => 6,
+    }
 }

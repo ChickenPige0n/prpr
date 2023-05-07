@@ -1,6 +1,6 @@
 [package]
 name = "prpr"
-version = "0.3.2"
+version = "0.3.1"
 edition = "2021"
 
 [lib]
@@ -15,7 +15,6 @@ async-trait = "0.1"
 base64 = "0.21.0"
 cfg-if = "1.0.0"
 chardetng = "0.1.17"
-chrono = "0.4.23"
 concat-string = "1.0.1"
 csv = "1.1.6"
 fastblur = "0.1.1"
@@ -44,11 +43,15 @@ tempfile = "3.3.0"
 unic-langid = { version = "0.9.1", features = ["macros"] }
 zip = { version = "0.6.3", default-features = false, features = ["deflate"] }
 
+byteorder = "1.4.3"
+chrono = "0.4.24"
+hex = "0.4.3"
 hmac = "0.12.1"
 miniz_oxide = "0.7.1"
-obfstr = "0.4.1"
+obfstr = "=0.4.1"
 sha2 = "0.10.6"
 subtle = "2.4.1"
+libc = "0.2.142"
 
 [target.'cfg(not(any(target_os = "android", target_os = "ios")))'.dependencies]
 rfd = "0.10"
@@ -70,7 +73,7 @@ sasa = { git = "https://github.com/Mivik/sasa" }
 tokio = { version = "1.23", features = ["rt-multi-thread", "fs"] }
 
 [target.'cfg(target_arch = "wasm32")'.dependencies]
-tokio = { version = "1.23", default-features = false }
+tokio = "1.23"
 web-sys = { version = "0.3", features = [
 	"Location",
 	"Performance",

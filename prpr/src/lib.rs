@@ -1,5 +1,7 @@
+pub mod bin;
 pub mod config;
 pub mod core;
+pub mod dir;
 pub mod ext;
 pub mod fs;
 pub mod info;
@@ -22,7 +24,7 @@ pub use scene::Main;
 
 pub fn build_conf() -> macroquad::window::Conf {
     macroquad::window::Conf {
-        window_title: "prpr".to_string(),
+        window_title: "Phira".to_string(),
         window_width: 1080,
         window_height: 608,
         ..Default::default()

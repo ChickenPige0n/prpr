@@ -271,7 +271,7 @@ async fn the_main() -> Result<()> {
     let fs = Box::new(PatchedFileSystem(fs, edit.to_patches().await?));
     static MSAA: AtomicBool = AtomicBool::new(false);
     let mut main = Main::new(
-        Box::new(LoadingScene::new(GameMode::Normal, edit.info, config, fs, (None, None), Some(Rc::new(move || (vw, vh))), None).await?),
+        Box::new(LoadingScene::new(GameMode::Normal, edit.info, config, fs, None, Some(Rc::new(move || (vw, vh))), None).await?),
         tm,
         {
             let mut cnt = 0;

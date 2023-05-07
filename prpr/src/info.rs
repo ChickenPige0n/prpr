@@ -7,13 +7,14 @@ pub enum ChartFormat {
     Rpe = 0,
     Pec,
     Pgr,
+    Pbc,
 }
 
 #[derive(Clone, Serialize, Deserialize)]
 #[serde(default)]
 #[serde(rename_all = "camelCase")]
 pub struct ChartInfo {
-    pub id: Option<String>,
+    pub id: Option<i32>,
 
     pub name: String,
     pub difficulty: f32,
@@ -27,15 +28,16 @@ pub struct ChartInfo {
     pub music: String,
     pub illustration: String,
 
-    pub preview_time: f32,
+    pub preview_start: f32,
+    pub preview_end: Option<f32>,
     pub aspect_ratio: f32,
     pub background_dim: f32,
     pub line_length: f32,
     pub offset: f32,
     pub tip: Option<String>,
+    pub tags: Vec<String>,
 
     pub intro: String,
-    pub tags: Vec<String>,
 
     pub hold_partial_cover: bool,
 }
@@ -57,15 +59,16 @@ impl Default for ChartInfo {
             music: "song.mp3".to_string(),
             illustration: "background.png".to_string(),
 
-            preview_time: 0.,
+            preview_start: 0.,
+            preview_end: None,
             aspect_ratio: 16. / 9.,
             background_dim: 0.6,
             line_length: 6.,
             offset: 0.,
             tip: None,
+            tags: Vec::new(),
 
             intro: String::new(),
-            tags: Vec::new(),
 
             hold_partial_cover: false,
         }

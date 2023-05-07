@@ -89,7 +89,7 @@ impl Scene for MainScene {
                         info,
                         config,
                         Box::new(PatchedFileSystem(fs, edit.to_patches().await?)),
-                        (None, None),
+                        None,
                         None,
                         None,
                     )

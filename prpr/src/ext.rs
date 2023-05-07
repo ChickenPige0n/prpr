@@ -3,8 +3,12 @@ use crate::{
     core::{Matrix, Point, Vector},
     ui::Ui,
 };
-use anyhow::Result;
+use anyhow::{anyhow, Result};
 use image::DynamicImage;
+use lyon::{
+    math::Box2D,
+    path::{builder::BorderRadii, Path, Winding},
+};
 use macroquad::prelude::*;
 use miniquad::{BlendFactor, BlendState, BlendValue, CompareFunc, Equation, PrimitiveType, StencilFaceState, StencilOp, StencilState};
 use once_cell::sync::Lazy;
@@ -51,11 +55,23 @@ impl<T: Sized + Float> NotNanExt for T {
 
 pub trait RectExt: Sized {
     fn feather(&self, radius: f32) -> Self;
+    fn to_euclid(&self) -> Box2D;
+    fn rounded(&self, radius: f32) -> Path;
 }
 
 impl RectExt for Rect {
     fn feather(&self, radius: f32) -> Self {
         Self::new(self.x - radius, self.y - radius, self.w + radius * 2., self.h + radius * 2.)
+    }
+
+    fn to_euclid(&self) -> Box2D {
+        Box2D::new(lyon::math::point(self.x, self.y), lyon::math::point(self.right(), self.bottom()))
+    }
+
+    fn rounded(&self, radius: f32) -> Path {
+        let mut path = Path::builder();
+        path.add_rounded_rectangle(&self.to_euclid(), &BorderRadii::new(radius), Winding::Positive);
+        path.build()
     }
 }
 
@@ -73,6 +89,17 @@ impl SafeTexture {
         let res = arc.0;
         std::mem::forget(arc);
         res
+    }
+
+    pub fn with_mipmap(self) -> Self {
+        let id = self.0 .0.raw_miniquad_texture_handle().gl_internal_id();
+        unsafe {
+            use miniquad::gl::*;
+            glBindTexture(GL_TEXTURE_2D, id);
+            glGenerateMipmap(GL_TEXTURE_2D);
+            glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MIN_FILTER, GL_LINEAR_MIPMAP_LINEAR as _);
+        }
+        self
     }
 }
 
@@ -258,6 +285,27 @@ fn drop_shadow(p: [Point; 4], alpha: f32) {
     gl.geometry(&p, &[0, 1, 2, 1, 2, 3, 0, 1, 5, 0, 5, 4, 4, 5, 6, 5, 6, 7, 6, 7, 2, 7, 2, 3]);
 }
 
+pub fn rect_shadow(r: Rect, radius: f32, alpha: f32) {
+    let t = r.feather(radius);
+    let v = |x: f32, y: f32, c: Color| Vertex::new(x, y, 0., 0., 0., c);
+    let a = Color::new(0., 0., 0., alpha);
+    let b = Color::default();
+    let p = [
+        v(t.x, t.y, b),
+        v(t.right(), t.y, b),
+        v(r.x, r.y, a),
+        v(r.right(), r.y, a),
+        v(r.x, r.bottom(), a),
+        v(r.right(), r.bottom(), a),
+        v(t.x, t.bottom(), b),
+        v(t.right(), t.bottom(), b),
+    ];
+    let gl = unsafe { get_internal_gl() }.quad_gl;
+    gl.texture(None);
+    gl.draw_mode(DrawMode::Triangles);
+    gl.geometry(&p, &[0, 1, 2, 1, 2, 3, 0, 2, 4, 4, 0, 6, 4, 5, 6, 5, 6, 7, 1, 3, 5, 5, 1, 7]);
+}
+
 pub fn thread_as_future<R: Send + 'static>(f: impl FnOnce() -> R + Send + 'static) -> impl Future<Output = R> {
     struct DummyFuture<R>(Arc<Mutex<Option<R>>>);
     impl<R> Future for DummyFuture<R> {
@@ -377,6 +425,81 @@ pub fn make_pipeline(write_color: bool, pass_op: StencilOp, test_func: CompareFu
     .unwrap()
 }
 
+#[inline]
+pub fn semi_black(alpha: f32) -> Color {
+    Color::new(0., 0., 0., alpha)
+}
+
+#[inline]
+pub fn semi_white(alpha: f32) -> Color {
+    Color::new(1., 1., 1., alpha)
+}
+
+pub fn unzip_into<R: std::io::Read + std::io::Seek>(reader: R, dir: &crate::dir::Dir, strip_root: bool) -> Result<()> {
+    let mut zip = zip::ZipArchive::new(reader)?;
+    let root = if strip_root {
+        if let Some(root) = zip.file_names().min_by_key(|it| it.len()) {
+            if root.ends_with('/') && zip.file_names().all(|it| it.starts_with(&root)) {
+                root.to_owned()
+            } else {
+                String::new()
+            }
+        } else {
+            String::new()
+        }
+    } else {
+        String::new()
+    };
+    info!("root is {}", root);
+    for i in 0..zip.len() {
+        let mut entry = zip.by_index(i)?;
+        let path = entry.enclosed_name().ok_or_else(|| anyhow!("invalid zip"))?;
+        let path = path.display().to_string();
+        info!("entry: {}", path);
+        if entry.is_dir() && entry.name() != root {
+            if let Some(after) = path.strip_prefix(&root) {
+                info!("- mkdir: {}", after);
+                dir.create_dir_all(after)?;
+            }
+        } else if entry.is_file() {
+            if let Some(after) = path.strip_prefix(&root) {
+                if let Some(p) = std::path::Path::new(after).parent() {
+                    if !dir.exists(p)? {
+                        info!("- mkdir {}", p.display());
+                        dir.create_dir_all(p)?;
+                    }
+                }
+                info!("- create {}", after);
+                let mut file = dir.create(after)?;
+                std::io::copy(&mut entry, &mut file)?;
+            }
+        }
+    }
+    Ok(())
+}
+
+pub fn parse_time(s: &str) -> Option<f32> {
+    if s.is_empty() {
+        return None;
+    }
+    let r = s.split(':').collect::<Vec<_>>();
+    if r.len() > 3 {
+        return None;
+    }
+    let mut iter = r.into_iter().rev();
+    let mut res = iter.next().unwrap().parse::<f32>().ok()?;
+    if res < 0. {
+        return None;
+    }
+    if let Some(mins) = iter.next() {
+        res += mins.parse::<u32>().ok()? as f32 * 60.;
+    }
+    if let Some(hrs) = iter.next() {
+        res += hrs.parse::<u32>().ok()? as f32 * 3600.;
+    }
+    Some(res)
+}
+
 mod shader {
     pub const VERTEX: &str = r#"#version 100
 attribute vec3 position;
@@ -402,6 +525,6 @@ varying lowp vec2 uv;
 uniform sampler2D Texture;
 
 void main() {
-    gl_FragColor = color * texture2D(Texture, uv) ;
+    gl_FragColor = color * texture2D(Texture, uv);
 }"#;
 }
